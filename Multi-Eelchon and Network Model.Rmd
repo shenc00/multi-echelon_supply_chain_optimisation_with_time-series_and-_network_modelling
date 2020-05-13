@@ -1,0 +1,961 @@
+---
+title: "Multi-Echelon Inventory Optimization using Network Analysis"
+output: html_notebook
+---
+
+\n
+
+## Introduction
+
+The **multi-echelon invenotry system** is a hierarchical and multilocation inventory management system that **optimises stocks at different locations** with a centralized appraoch. The model is composed of stages, which are grouped into echelons. The stages can be physical locations, items in bill of materials (BoM) or processing activities. In the most basic model, each stage functions are a EOQ system whereby the input is the sum of expected demand from the previous stage.The objective is to achieve a **balance between the amount of saftey stock to hold and the cost of holding the stock**. 
+
+Using this model, we will be calculating the optimsed level of finished goods in the first 2 levels (DC and global central warehouse). In the production stage, we will use the **network analysis model** to compute the quantity of raw materials and subassemblies required to build the BoM of each finished good. With the total quantity, we can then apply the multi-echelon model on the raw materials and subassemblies.
+
+
+We use the *ggprah package* for network plots and the *igraph package* for network analysis calculations. The *threejs package* provides an interactive plot to visualise the highly complicated aggregated BoMs. 
+
+```{r Load required packages, warning=FALSE}
+pacman::p_load(tidyr, dplyr, ggplot2, openxlsx, igraph, ggraph, stringr, threejs, tidygraph)
+```
+
+Change the path directory to our work directory (where we keep the work files).
+
+```{r setup, include=FALSE}
+# knitr::opts_knit$set(root.dir = "C:/Users/cshen/Documents/Dataset")
+knitr::opts_knit$set(root.dir = "C:/Users/Shenc/Documents/NUS EBAC/Capstone Project/Dataset")
+getwd()
+```
+
+**Load the required data:**
+
+1. **BoM data** - can be loaded individually from xlsx files, then append to a single data frame. To include more bom data, simply load the new file with the name *"bom.n"* (where n is an integer), and add it inside the *rbind() function*. 
+
+2. **m2 data** extracted from *MITBAL* table. The current file used is in csv format. To import xlsx file, change *"read.csv"* to *"read.xlsx"*. These fields are essential: **MBITNO, MBWHLO, MBLEAT, MBSSQT, MBSTQT**
+
+*Note that dataset 3 - 4 will only be available after getting the dataset from database queries*
+
+3. **cost information** extracted from *MITFAC* table. These fields are essential: **M9ITNO, ZBWHLO, M9APPR, ZBCFI1** 
+
+4. Get **MADV** information for raw materials/subassemblies goods. An alternative way is to compute the standard deviation with forecast from running the *ARIMA model*.
+
+5. **Forecast** for finished goods using the *ARIMA model (see separate script)*. Depending on requirement, 12 period of forecast is used for current computation. These fields are essential: **forecast, root** (itno of the finished good), and **warehouse**, are included in the output of the ARIMA model. 
+
+```{r Load data, include=FALSE}
+# get individual boms
+bom.1 <- read.xlsx("BOM_01.xlsx", sheet = "185930")
+bom.2 <- read.xlsx("BOM_01.xlsx", sheet = "226028")
+
+# append all bom data
+bom <- as.data.frame(rbind(bom.1, bom.2))
+
+# get m2 item master
+m2 <- read.csv("MITBAL.csv")
+```
+
+```{r include=FALSE}
+# get a list of bom and finished good for query of information
+
+# create an identifier for different type of warehouse
+p.whse <- c("MF1", "BT1", "VN1")
+dc.whse <- c("001", "AD1", "UD1")
+
+# get finished good list
+finished_good <- bom %>%
+  select(BAITNO) %>%
+  
+  # rename item number for standardization
+  rename(itno = BAITNO) %>%
+  unique() %>%
+  mutate(whse = "GD1")
+
+# get material list
+material <- bom %>%
+  
+  #select the required fields
+  select(BAAITN, BAFACI) %>%
+  
+  # filter for production warehouse
+  filter(BAFACI %in% p.whse) %>%
+  
+  # get unique rows
+  unique() %>%
+  
+  # rename item number and warehouse for standardization
+  rename(itno = BAAITN,
+         whse = BAFACI)
+
+# get full list
+all_material <- rbind(finished_good, material)
+
+# set file path
+path = "C:/Users/Shenc/Documents/NUS EBAC/Capstone Project/Output/"
+
+# print to excel
+# these files will be used to get the cost, demand deviation and forecast datasets
+write.xlsx(finished_good, file = paste(path, "finished_good.xlsx"))
+write.xlsx(material, file = paste(path, "material.xlsx"))
+write.xlsx(all_material, file = paste(path, "all_material.xlsx"))
+```
+
+```{r include=FALSE}
+# this can be run only after getting the neccessary information from the database query
+# inventory cost
+inv_cost <- read.csv("BOM_inv cost.csv",
+                      colClasses = c("M9ITNO" = "character",
+                                     "ZBWHLO" = "character",
+                                     "ZBCFI1" = "character"))
+
+# demand deviation
+madv <- read.xlsx("BOM_dev.xlsx")
+ 
+# finished goods forecast
+fg.forecast <- read.csv("forecast_output.csv",
+                        colClasses = c("MTITNO" = "character",
+                                       "whse" = "character"))
+```
+******
+
+## Data Preparation
+
+**Requirement 1: cost information**
+
+The **cost assumptions** are as follows:
+
+1. **fixed cost (k)** = USD0.869  (arbitrary)
+2. **holding cost (h)** = 10% of the inventory cost (M9APPR) in respective warehouses
+3. there are **neither stockout penalty cost (p=0) nor purchase cost (c=0)**
+
+```{r}
+# establish cost table for production warehouses
+cost_prod <- inv_cost %>%
+  
+  # get correct warehouse
+  filter(ZBWHLO %in% p.whse,
+         ZBCFI1 == "  1") %>%
+  # add columns for k and h
+  mutate(k = 0.869,
+         h = 0.1 * M9APPR) %>%
+  
+  # select the required fields
+  select(M9ITNO, ZBWHLO, k, h) %>%
+  
+  # remove duplicated rows
+  unique() 
+
+
+# establish cost table for distribution warehouses
+cost_dc <- inv_cost %>%
+  
+  # get correct warehouse
+  filter(ZBWHLO %in% c(dc.whse, "GD1")) %>%
+  # add columns for k and h
+  mutate(k = 0.869,
+         h = 0.1 * M9APPR) %>%
+  
+  # select the required fields
+  select(M9ITNO, ZBWHLO, k, h) %>%
+  
+  # remove duplicated rows
+  unique() 
+
+# bind the two warehouse
+cost <- rbind(cost_prod, cost_dc) 
+
+cost <- cost %>%
+  
+  # rename item number and warehouse for standardization
+  rename(itno = M9ITNO,
+         whse = ZBWHLO) %>%
+  
+  # remove blank spaces in values
+  mutate(whse = str_trim(whse, side = c("both")),
+         itno = str_trim(itno, side = c("both")))
+
+# call the first few rows of cost table
+head(cost)
+```
+**Requirement 2: bill of materials (BoM)**
+
+Clean the bom data to **remove invalid/expired item numbers** and standardise variable namings where
+
+1. **root** = finished goods of the bom
+2. **itno** = input raw material / subassemblies
+3. **qty** = quantity required for the input material
+4. **m1_stat** = include only valid items (stat < 50)
+5. **type** = business definition (MMACRF) of material type (may be different from the network theory concept)
+6. **whse** = warehouse where the production takes place
+7. **level** = level of the material in the BoM
+8. **used_in** = output subassemblies / raw material of the input material
+
+```{r warning=FALSE}
+clean <- bom %>%
+  
+  # rename variables to standardise
+  # if the variables names from the imported datasets are changed, please modify accordingly
+  rename(itno = BAAITN,
+         qty = BACNQT,
+         root = BAITNO,
+         whse = BAFACI,
+         used_in = BAPTID,
+         level = BALEVL,
+         type = XMACRF,
+         m1_stat = XMSTAT
+         ) %>%
+  
+  # drop unused fields
+  select(-c(BAISEQ, BACTID, XMITDS, XMDWNO, BATRID)) %>%
+  
+  # remove expired warehouse 
+  # remove qty = 0
+  # remove m1 status >= 50
+  # remove item number starting with "T" and "X"
+  filter(!whse %in% c("MA1", "H", "TUT"),
+         qty >= 1,
+         m1_stat < 50,
+         !str_detect(itno, pattern = "^T"),
+         !str_detect(itno, pattern = "^X"),
+         !str_detect(used_in, pattern = "^T"),
+         !str_detect(used_in, pattern = "^X")) %>%
+  
+  # remove duplicated rows due to dropped variable
+  unique() %>%
+  
+  # remove blank spaces in values
+  # convert decimal in qty to 1
+  # define product type based on MMACRF
+  mutate(whse = str_trim(whse, side = c("both")),
+         itno = str_trim(itno, side = c("both")),
+         root = str_trim(root, side = c("both")),
+         used_in = str_trim(used_in, side = c("both")),
+         qty = ifelse(qty > 0 & qty < 1, 1, qty),
+         type = case_when(str_detect(type, pattern = "^\\.6") == 1 ~ "finished",
+                            str_detect(type, pattern = "^\\.4") == 1 | str_detect(type, pattern = "^\\.5") == 1 ~ "semi_finished",
+                            TRUE ~ "raw_material")) %>%
+  
+  # arrange by itno
+  arrange(itno)
+
+# call the first few rows of cleaned bom
+head(clean)
+```
+
+Join the cleaned data frames
+```{r warning=FALSE}
+bom_cln <- clean %>%
+  # insert cost information
+  left_join(cost, by = c("itno", "whse")) %>%
+  
+  # insert annual consumption
+  left_join(m2, by = c("itno" = "MBITNO",
+                       "whse" = "MBWHLO")) %>%
+  
+  # select columns
+  select(root, itno, qty, m1_stat, whse, level, used_in, k, h) %>%
+  arrange(itno)
+
+# call the first few rows of the dataframe
+head(bom_cln)
+```
+**Requirement 3: finished good forecast**
+
+```{r}
+# insert a time sequence for the forecast
+# modify the dates to calculate for forecast of a different period
+date <- seq(as.Date("2020/01/01"), as.Date("2020/12/01"), by = "month")
+fg.forecast$period <- rep(date, times = 1)
+
+fg.forecast_cln <- fg.forecast %>%
+  
+  # rename MTITNO to standardise
+  rename(root = MTITNO) %>%
+  
+  # remove blank spaces in values
+  mutate(whse = str_trim(whse, side = c("both")),
+         root = str_trim(root, side = c("both")))
+```
+******
+
+## Multi-echelon Model computations
+
+**Supply Chain Assumptions - pure push system**
+
+1. produce to forecast
+2. zero committed service time to customers
+
+**EOQ Model Assumptions**
+
+1. a 3-echelon inventory for single product (Production -> GDC -> DC)
+2. constant unit price at different points
+3. a continuous review policy (Q, r) is used to keep track of inventory at each stage at all times
+4. time series forecast output is constant and normally distributed per year
+5. the safety stock level of each company is a positive quantity
+6. the lead-time is constant
+7. batch production
+
+[Click here for model formula reference](http://egon.cheme.cmu.edu/ewo/docs/SnyderEWO_081113.pdf)
+
+We start by creating a general table with all neccessary information for model paramters computations.
+
+Note that:
+
+1. **forecast.ttl**= total forecast per item and warehouse for the period (in this case, 12 periods from 2020-01 to 2020-12)
+2. **dev** = standard deviation per item and warehouse for the period
+
+```{r warning=FALSE}
+# compute annual demand and standard deviation per warehouse per item number
+anl.demand <- fg.forecast_cln %>%
+  
+  # join forecast to cost table
+  left_join(cost, by = c("root" = "itno", 
+                         "whse")) %>%
+  group_by(root, whse, k, h) %>%
+  
+  # compute annual forecast and standard deviation per item number (finished good)
+  summarise(forecast.ttl = sum(forecast),
+            dev =sd(forecast)) %>%
+  
+  # join to m2 table to extract leadtime and current saftey stock setting
+  left_join(m2, by = c("root" = "MBITNO",
+                       "whse" = "MBWHLO")) %>%
+  select(root, whse, k, h, forecast.ttl, dev, MBLEAT, MBSSQT) %>%
+  ungroup()
+
+# call the first few rows of the dataframe
+head(anl.demand)  
+```
+
+We start the **multi-echelon model** calculation in the **first level - DC**. 
+
+We compute the **EOQ model parameters** with **standard formula** as follows:
+
+1. **economic order quantity (EOQ)** = sqr(2 * k * annual demand / h)
+2. **reorder interval** = EOQ / annual demand
+3. **saftey stock (ss)** at *97% service level* calculated using the *SCperf package*
+4. **reorder point (ROP)** = (leadtime * demand per day) + saftey stock
+5. **total demand from DC (expected_demand)** = calculated saftey stock + annual demand
+
+```{r}
+# Compute model parameters for DC
+dc.demand <- anl.demand %>%
+  
+  # filter for DCs
+  filter(whse %in% dc.whse) %>%
+  
+  # compute the required fields
+  mutate(EOQ = sqrt(k * forecast.ttl / h),
+         reorder_interval = EOQ / forecast.ttl,
+         ss = SCperf::SS(0.97, dev, MBLEAT),
+         ROP = (MBLEAT * forecast.ttl /365) + ss,
+         expected_demand = ss + forecast.ttl) %>%
+  
+  # rename root for standardization
+  rename(itno = root)
+
+# call the first few rows of the dataframe
+dc.demand %>%
+  select(itno, whse, EOQ, reorder_interval, ss, ROP, expected_demand) %>%
+  head()
+```
+
+The input for the **second level - GDC** will be based on:
+
+1. **annual demand (expected_demand*)** will be the *total forecast demand + calculated saftey stock* from level 1 for *all DCs per item number*. The assumption is that we need to cover for both the demand from external parties as well as the saftey stock in DC to achieve the target service level (97% in this case)
+
+2. **standard deviation** is calculated from the total monthly demand forecast (ARIMA model) of the DC demands
+
+```{r}
+# get standard deviation per item number for total demand in all DCs
+dc.sd <- fg.forecast_cln %>%
+  
+  #filter for DCs 
+  filter(whse %in% dc.whse) %>%
+  group_by(root, period) %>%
+  
+  # compute total forecast of all DCs by period
+  summarise(forecast.ttl = sum(forecast)) %>%
+  group_by(root) %>%
+  
+  # compute the standard deviation for the total annual demand of all DCs
+  summarise(dev = sd(forecast.ttl))
+
+# call the first few rows of the dataframe
+head(dc.sd)
+```
+
+```{r}
+# Compute model parameters for GDC
+gd1.demand <-  dc.demand %>%
+  group_by(itno) %>%
+  
+  # sum the expected demand for all DCs
+  summarise(demand.GD1 = sum(expected_demand)) %>%
+  
+  # create the identity column for GDC
+  mutate(whse = "GD1") %>%
+  
+  # get cost information from general table
+  left_join(anl.demand, c("itno" = "root", "whse")) %>%
+  
+  # select the required columns
+  select(itno, whse, demand.GD1, k, h, MBLEAT, MBSSQT) %>%
+  
+  # rename the input demand field to standardise
+  rename(forecast.ttl = demand.GD1) %>%
+
+  # get the calculated standard deviation
+  inner_join(dc.sd, by = c("itno" = "root")) %>%
+  
+  # compute the required fields
+  mutate(EOQ = sqrt(k * forecast.ttl / h),
+         reorder_interval = EOQ / forecast.ttl,
+         ss = SCperf::SS(0.97, dev, MBLEAT),
+         ROP = MBLEAT * forecast.ttl /365 + ss,
+         expected_demand = ss + forecast.ttl)
+
+
+# call the first few rows of the dataframe
+gd1.demand %>%
+  select(itno, whse, EOQ, reorder_interval, ss, ROP, expected_demand) %>%
+  head()
+```
+
+Now we are ready to compute the model variables for the **final level - production**. Here, the **input** will be the *expected demand per finished good from level 2 (GDC)*. The **output** will be the model parameters for all *raw materials and suassemblies* used in the *BoM* to build the model. In order to compute the output, we use **network analysis model** to compute the quantity of materials to build each finished good in the BoM. The quantity required per material will then be sum up to obtain the demand per period (in our case, 12 periods).
+
+Note that in this demonstration, we are using only *2 finished goods* to construct an aggregated BoM. This means that the quantity required for the materials are only a very small amount that are consumed by these 2 finished goods. In reality, they would have been consumed by many other finished goods and therefore our *calculation outcome would be much lower than the real consumption*. To get the full picture of consumption for one material, we would need to include all the BoMs that consume the particular material. 
+
+
+We will first move on to the network analysis model before finally computing for the multi-echelon model parameters at the material level.
+
+******
+
+## Network Analysis Model
+
+Build a basic *directed* network of aggregated BoM using the *igraph package*. 
+
+The network features are explained as below:
+
+1. **direction** - the flow of materials, from a higher level (finished good) to a lower level 
+2. **edges** - the link between two vertices
+3. **vertices** - a vertex represents a item number in the BoM
+
+```{r}
+# convert level data to matrix
+relationship <- bom_cln %>%
+  select(used_in, itno) %>%
+  as.matrix()
+
+# Convert matrix to an igraph object
+g <- graph.edgelist(relationship, directed = TRUE)
+
+# name network
+g$name <- "BOM_rm008341"
+
+# Count number of edges
+cat("Number of links:", gsize(g),"\n")
+
+# Count number of vertices
+cat("\nNumber of Item numbers:", gorder(g), "\n")
+```
+
+Inventory parameters can be added to the network as edge or vertex attributes. 
+
+**Edge attributes:**
+
+1. quantity used for each material
+2. BoM level
+3. leadtime of each material
+4. root item (i.e. finished goods) as an identifier
+
+**Vertex attributes:**
+
+1. production warehouse
+2. inventory type (business definition)
+3. root item (i.e. finished goods) as an identifier
+
+```{r message=FALSE, warning=FALSE}
+# get vertex name
+v.name <- as.data.frame(V(g)$name) 
+colnames(v.name) <- "itno"
+
+# Create new edge attribute for qty --> used as edge weights
+g <- set_edge_attr(g, "weight", value = bom_cln$qty)
+
+# Create new edge attribute for BOM level
+g <- set_edge_attr(g, "level", value = bom_cln$level)
+
+# Create new edge attribute for leadtime 
+
+get_leadtime <- bom_cln %>%
+  left_join(m2, by = c("itno" = "MBITNO",
+                        "whse" = "MBWHLO")) %>%
+  select(itno, MBLEAT, whse) %>%
+  unique()
+
+g <- set_edge_attr(g, "leadtime", value = get_leadtime$MBLEAT)
+
+# Create new vertex attribute for production warehouse
+whse <- bom_cln %>%
+  right_join(v.name, by =("itno")) %>%
+  select(whse)%>%
+  as.matrix() 
+
+g <- set_vertex_attr(g, "whse", value = whse)
+
+# Create new edge attribute for BOM level
+# g <- set_vertex_attr(g, "type", value = type)
+
+g <- set_vertex_attr(g, "type" , 
+                     value = case_when(degree(g, mode = "in") == 0 ~ "finished_goods",
+                                       degree(g, mode = "in") != 0 & degree(g, mode = "out") == 0 ~ "raw_material",
+                                       degree(g, mode = "out") != 0 & degree(g, mode = "in") != 0 ~ "subassembly",
+                                       TRUE ~ "not_defined"))
+
+# Create new vertex and edge attribute for root item
+root <- bom_cln %>%
+  right_join(v.name, by =("itno")) %>%
+  mutate(root = ifelse(is.na(root), itno, root)) %>%
+  select(root) %>%
+  as.matrix()
+
+g <- set_vertex_attr(g, "root", value = root)
+g <- set_edge_attr(g, "root", value = bom_cln$root)
+
+# View attributes of first ten vertices in a dataframe
+V(g)[[1:153]]
+
+# View attributes of first ten edges in a dataframe
+E(g)[[1:207]]
+```
+
+We can visualise the basic network with an interactive plot using the *threejs package*. The plot can be expanded and rotated by moving your mouse over it. 
+
+```{r echo=FALSE}
+l1 = light_directional(color = "tomato", position = c(0, -0.8, 0.5))
+l2 = light_directional(color = "peachpuff", position = c(0, 0.8, -0.5))
+l3 = light_ambient(color = "lightsalmon")
+
+
+# interative plot
+set.seed(101)
+
+graphjs(g, 
+        vertex.color = "tomato",
+        vertex.size = 1,
+        vertex.shape="sphere",
+        lights=list(l1, l2, l3),
+        edge.color = "gray",
+        edge.width = 0.5,
+        edge.alpha = 0.7) %>% 
+  points3d(vertices(.), 
+           color="tomato", 
+           #pch=V(g)$label,
+           size = 0.5,
+           labels = V(g)$name)
+```
+
+We can use *network theories* to analyse the aggregated BoM:
+
+1) **In-degree** is the number of edges received by or going into a vertex, represents the number of product (finished good or subassembly) composing of a specific subassembly or raw material 
+2) **Out-degree** is the number edges directed away from a vertex, represents the number of subassemblies or raw material from which the product is composed 
+3) **In-strength** is the sum of weight (in our case, qty used) received by or going into a vertex, represents the overall participation of a part in the product considering both the occurrence in the BoM network in which it is involved and the required quantities
+4) **Betweeness centrality** is the extend to which a vertex lies in the path between other vertex, measures the criticiality of a product in the aggregated BoM network 
+
+[Click here for the reference material](https://journals.sagepub.com/doi/pdf/10.1177/1847979017732638)
+
+Hence we can classify the vertex (item number) according their network properties:
+
+1) In-degree = 0 -> **finished goods**
+2) In-degree > 0 & out-degree = 0 -> **raw material**
+3) In-degree > 0 & out-degree > 0 -> **subassembly**
+
+```{r eval=FALSE, include=FALSE}
+# in-degree = 0 --> finished product 
+g.fg <- as.data.frame(names(which(degree(g, mode = "in") == 0)))
+colnames(g.fg)<- "fg"
+
+# in-degree != 0, out-degree = 0 --> starting material (purchased product)
+g.rm <- as.data.frame(names(which(degree(g, mode = "in") != 0 & degree(g, mode = "out") == 0)))
+colnames(g.rm) <- "rm" 
+
+# in-degree != 0, out-degree != 0 --> subassembly
+g.sub <- as.data.frame(names(which(degree(g, mode = "out") != 0 & degree(g, mode = "in") != 0)))
+colnames(g.sub) <- "subassembly" 
+
+# in-degree != 0, out-degree != 0, at least a neighbour with out-degree = 0  --> directly compose of starting material
+adj_v <-names((which(degree(g, mode = "out") != 0 & degree(g, mode = "in") != 0)))
+g.dm <- adjacent_vertices(g, adj_v, mode = c("all"))
+
+
+df <- matrix(nrow = length(g.dm), ncol = 2)
+
+for (i in 1:length(g.dm)){
+
+    g.outd <- length(degree(g, g.dm[[i]], mode = "out") == 0) 
+    vertex <- names(g.dm)[[i]]
+    df[i,] <- c(vertex, g.outd)
+
+}
+
+colnames(df) <- c("vertex", "count") 
+comp <- df
+```
+
+We calculate required quantity for each material in an aggregated BoM using the **in-strength** concept. 
+```{r warning=FALSE}
+# get a list of finished goods (vertex with in-degree = 0)
+fg_list <- names(which(degree(g, mode = "in") == 0))
+
+# create an empty list to store loop item
+bom_list <- list()
+sub_g_list <- list()
+
+# loop through the finished good list to get the quantity required (from the network) and cost information (from previous table)
+for (i in fg_list){
+  
+sub.g <- subgraph.edges(g, E(g)[E(g)$root == i],  delete.vertices = TRUE)
+req.qty.g <- strength(sub.g, mode = "in")
+vertex.name.g <- names(req.qty.g)
+root.g <- i
+
+rqty.g <- as.data.frame(cbind(vertex.name.g, req.qty.g, root.g))
+colnames(rqty.g) <- c("itno", "qty", "root")
+
+rqty.global <- rqty.g %>%
+  group_by(itno, root) %>%
+  summarise(t.qty = sum(as.numeric(as.character(qty))))
+
+cost_info <- rqty.global %>%
+  left_join(bom_cln, by = c("itno", "root")) %>%
+  select(root, itno, t.qty, whse, k, h) %>%
+  unique()
+
+bom_list[[i]] <- cost_info
+sub_g_list[[i]] <- sub.g
+
+}
+
+# unlist the BoM list into a dataframe
+bom.df <- do.call(rbind.data.frame, bom_list) 
+
+# call the first few rows of the dataframe
+head(bom.df)
+```
+
+Using the looped outcome, we can create subgraphs for the BoM of each *inidividual finished good*.  
+
+```{r warning=FALSE, include=FALSE}
+# custom plot function
+plot_sub_graph <- function(index){
+set.seed(101)
+ggraph(sub_g_list[[index]], layout = 'dendrogram', circular = TRUE) + 
+  geom_edge_diagonal(colour="grey") +
+  geom_node_text(aes(x = x*1.15, y=y*1.15, label=name, colour=factor(type)), size=2.7, alpha=1) +
+  geom_node_point(aes(x = x*1.07, y=y*1.07, colour=factor(type), alpha=0.2)) +
+  theme_void() +
+  theme(
+    legend.position="none",
+    plot.margin=unit(c(0,0,0,0),"cm"),
+  ) +
+  expand_limits(x = c(-0.5, 0.5), y = c(-0.5, 0.5))
+}
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# change the index number to view a subgraph for a different finished good
+plot_sub_graph(index=1)
+```
+
+
+```{r eval=FALSE, include=FALSE}
+  ggraph:::igraphlayouts
+```
+
+
+The below sections are some visualisations of  **key insights** of the **network theory** with **operational implications**. We will be using a *reduced subgraph* for better visualisation experience. 
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# select vertices for subgraph
+subv <- c('185930','803909','803183', '226028', '820193', '187811', '187813', "803909",
+          '040937', '103898', '800392', '114191' , '274229','008341', '233550',
+          '217638','041168', '084677', '050258', '816799' , '059870','186898', '819480')
+
+# create subgraph for visualisation purpose
+g2 <- induced.subgraph(g, vids = subv)
+
+# set graph parameters - arrow
+arrow <- arrow(angle=30,length=unit(1.5,"mm"),ends="last",type="closed")
+
+# save graph to working directory
+png(filename="sub_bom.png", width=500, height=500)
+
+ggraph(g2, layout = 'with_sugiyama') + 
+    geom_edge_link(aes(alpha = factor(weight)),
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="Qty required") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = 4) +
+  geom_node_text(aes(label = name), 
+                 size = 3, vjust = 1.5, angle = 45, alpha = 0.8, fontface = "italic") + 
+  scale_color_manual(name="Type of inventory",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph()
+
+dev.off()
+```
+
+The **betweeness centrality** concept can be used to identify **critical shared subassemblies**. Importance increases with size (applicable to other visualisations). This implies that production efforts should be focused on these products as any rescheduling or production changes will likely to have huge impact on many other products.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# set graph parameters - between
+g.between <- betweenness(g2, directed = TRUE)
+
+ggraph(g2, layout = 'with_sugiyama') + 
+    geom_edge_link(colour = "grey",
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="Qty required") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = g.between) +
+  # geom_node_text(aes(label = name), 
+  #                size = g.between, vjust = 1.5, angle = 45, alpha = 0.8, fontface = "italic") + 
+  scale_color_manual(name="",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph() +
+  theme(legend.position = 'bottom')
+```
+
+The **in-degree** concept can be used to identify **critical shared raw materials**.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# set graph parameters - degree
+g.degree <- degree(g2, mode = "in")
+
+ggraph(g2, layout = 'with_sugiyama') + 
+    geom_edge_link(colour = "grey",
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="Qty required") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = g.degree) +
+  # geom_node_text(aes(label = name), 
+  #                size = g.str, vjust = 1.5, angle = 45, alpha = 0.8, fontface = "italic") + 
+  scale_color_manual(name="",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph() +
+  theme(legend.position = 'bottom')
+```
+
+The **in-strength** concept can be used to **identify raw materials or subassemblies with long leadtime**. This concept can be combined with the in-degree concept to select raw materials that should receive greater planning attention to secure a stable supply.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# set graph parameters - strength
+g.str <- strength(g2, mode = "in")
+
+ggraph(g2, layout = 'with_sugiyama') + 
+    geom_edge_link(aes(alpha = factor(leadtime)),
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="leadtime") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = g.str) +
+  # geom_node_text(aes(label = name), 
+  #                size = g.str, vjust = 1.5, angle = 45, alpha = 0.8, fontface = "italic") + 
+  scale_color_manual(name="",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph() +
+  theme(legend.position = 'bottom')
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# single bom - similar explanation with aggregated bom
+
+subv_single <- c('226028', '820193', '187811', '187813', '041168', '084677', '050258', '816799' , '059870','186898', '819480')
+
+g3 <- induced.subgraph(g, vids = subv_single)
+
+# set graph parameters - between
+g.between.s <- betweenness(g3, directed = TRUE)
+
+ggraph(g3, layout = 'as_tree') + 
+    geom_edge_link(colour = "grey",
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="Qty required") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = g.between.s) +
+  geom_node_text(aes(label = name), 
+                 size = g.between.s, vjust = 1.5, angle = 45, alpha = 0.8, fontface = "italic") + 
+  scale_color_manual(name="",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph() +
+  theme(legend.position = 'bottom')
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# set graph parameters - strength
+g.str.single <- strength(g3, mode = "in")
+
+ggraph(g3, layout = 'as_tree') + 
+    geom_edge_link(aes(alpha = factor(weight)),
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="Qty required") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = g.str.single) +
+  
+  scale_color_manual(name="",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph() +
+  theme(legend.position = 'bottom')
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# set graph parameters - degree
+g.degree.single <- degree(g3, mode = "in")
+
+ggraph(g3, layout = 'with_sugiyama') + 
+    geom_edge_link(colour = "grey",
+                   arrow = arrow, end_cap = circle(2, 'mm')) + 
+    scale_edge_alpha_discrete(name="Qty required") +
+    geom_node_point(aes(colour = factor(type)), 
+                    size = g.degree.single) +
+  geom_node_text(aes(label = name),
+                 size = g.degree.single, vjust = 1.5, angle = 45, alpha = 0.8, fontface = "italic") +
+  scale_color_manual(name="",
+                     guide=guide_legend(override.aes=list(label=c("finished_goods","raw_material", "subassembly"))),
+                     values=c("#F08080","#008B8B", "#BC8F8F"),labels=c("Finished Goods","Raw Material", "Subassembly")) +
+  theme_graph()+
+  theme(legend.position = 'bottom')
+```
+******
+
+### Multi-echelon Model computations - raw materials and subassemblies
+
+With the required quantity for each material, we can now compute the **level 3** multi-echelon model parameters for the subassemblies and raw materails with the following considerations:
+
+1. **annual demand (expected_demand*)* will be the *total forecast demand + calculated saftey stock* from level 2 for per item number. The assumption is that we need to cover for both the demand and saftey stock from *all previous levels*. 
+
+2. **standard deviation** can come from serveral methods:
+ + use the latest MADV in the system
+ + calculated from monthly demand forecast (ARIMA model) of the raw material / subassemblies goods (time consuming)
+ + any other user defined MADV
+
+*In this demonstration, we will be using method 1*
+*method 1 or 3 is reccomended for huge BoMs due to computational efficiency*
+
+```{r}
+# get the madv information
+# get the latest MADV (that is greater than 0) for each material by warehouse
+madv_latest <- madv %>%
+  
+  # filter for deviation greater than 0
+  filter(MFMADV > 0) %>%
+  
+  # get the latest deviation value
+  group_by(MFITNO) %>%
+  filter(MFCYP6 == max(MFCYP6)) %>%
+  
+  # select the required fields
+  select(MFITNO, MFWHLO, MFMADV, MFCYP6) %>%
+  
+  # rename item number and warehouse for standardization
+  rename(itno = MFITNO,
+         whse = MFWHLO)
+```
+
+*Note that in this example, the calculated expected demand cannot be compared directly with the calculated safety stock. This is because the former is only a subset of total real demand (i.e. consumed by other materials / finished goods which we have not taken into account) while the latter is based on standard deviation, expected service level and leadtime, which reflects the true amount of reccommended saftey stock. *
+```{r message=FALSE, warning=FALSE}
+# Compute model parameters for GDC
+mf1.demand <- gd1.demand %>%
+  
+  # rename root column
+  rename(root = itno) %>%
+  
+  # select the required fields
+  select(root, expected_demand) %>% 
+  
+  # join with network table 
+  inner_join(bom.df, by = c("root")) %>%
+  
+  # compute the required quantity for each material based on the demand for finished good
+  mutate(demand.material = expected_demand * t.qty) %>%
+  
+  # compute total demand per material 
+  group_by(itno, whse, k, h) %>%
+  summarise(expected_demand = sum(demand.material)) %>%
+  
+  # join table
+  left_join(madv_latest, by = c("itno", "whse")) %>%
+  
+  # replace missing values (if any) in MFMADV field with 0
+  mutate(MFMADV = replace_na(MFMADV, 0)) %>%
+  
+  # rename field for standardization
+  rename(dev = MFMADV,
+         forecast.ttl = expected_demand) %>%
+  
+  # remove finished good
+  anti_join(finished_good, by = "itno") %>%
+  
+  # get leadtime
+  left_join(m2, by = c("itno" = "MBITNO", 
+                       "whse" = "MBWHLO")) %>%
+  
+  # select the required columns
+  select(itno, whse, forecast.ttl, k, h, MBLEAT, dev, MBSSQT) %>%
+  # compute the required fields
+  mutate(EOQ = sqrt(k * forecast.ttl / h),
+         reorder_interval = EOQ / forecast.ttl,
+         ss = SCperf::SS(0.97, dev, MBLEAT),
+         ROP = MBLEAT * forecast.ttl /365 + ss,
+         expected_demand = ss + forecast.ttl) %>%
+  ungroup()
+
+# call the first few rows of the dataframe
+mf1.demand %>%
+  select(itno, whse, EOQ, reorder_interval, ss, ROP, expected_demand) %>%
+  head()
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+output_tbl <- rbind(dc.demand, gd1.demand, mf1.demand)
+
+path = "C:/Users/Shenc/Documents/NUS EBAC/Capstone Project/Output/"
+
+write.xlsx(output_tbl, file = paste(path, "multi_echelon_level_output.xlsx"))
+```
+******
+
+## Limitations
+
+1. **Cost is an important determinant** in the multi-echelon model. However, due to the lack of data, we are using an **arbitrary** figure, which may **result in inaccuracies** in the predictions. 
+2. Some **raw materials and subassemblies** are kept in the **distribution warehouses** and sold directly to end customers as merchandise (see bar chart below). Our model is unable to account for the demand here but can be forecasted with the ARIMA time series model. The figure should be included in the multi-echelon model to reflect the true consumption for raw materials and subassemblies.
+
+```{r echo=FALSE, warning=FALSE}
+sto_wh <- bom_cln %>%
+  select(itno, whse) %>%
+  unique() %>%
+  inner_join(m2, by = c("itno" = "MBITNO")) %>%
+  select(itno, MBWHLO, MBSTQT, MBSSQT, MBLEAT, whse) %>%
+  filter(MBWHLO %in% c(p.whse, dc.whse, "GD1")) %>%
+  mutate(store = ifelse(MBWHLO == whse, "yes", "no"))
+
+
+sto_wh %>%
+  ggplot(aes(x = MBWHLO, y = MBSTQT/1000000, group = factor(store))) +
+  geom_col(aes(fill = factor(store)), position = "stack") +
+  labs(x = "Warehouse",
+       y = "Stock on-hand (millions)",
+       title = "Raw-materials and Sub-assemblies Inventories") +
+  scale_fill_manual(name = "Production Warehouse", 
+                        labels = c("No", 
+                                   "Yes"), 
+                        values = c("no" = "#000080", 
+                                   "yes" = "#87CEFA")) +
+  theme_classic()
+```
+
+
+
+
+
