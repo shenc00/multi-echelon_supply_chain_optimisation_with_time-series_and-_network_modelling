@@ -1,0 +1,1591 @@
+---
+title: "Arima Modelling Process"
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+\n
+
+## Introduction
+
+The **ARIMA modelling** process is a **time series** forecasting technique. We can use this model to forecast for the future demand of finished goods in the distribution warehouses (DC) as input to the multi-echelon model, as well as raw materials and sub-assemblies that are not accounted for in the network model and sold as merchandise in the DCs. 
+
+The current model runs on a fully automated process and has the following **setups** which **can be modified** according to user's specific needs:
+
+1. A time series item comprises of **historical monthly consumption** of an **item number per warehouse**
+  + identification id is thus item number + warehouse
+2. The model uses a total of **60 data points** starting from 201501 to 201912
+  + **48 data points** are used for **training set** (201501 - 201812)
+  + **12 data points** are used for the **testing set** (201901 - 201912)
+3. **64 ARIMA models** of maximum parameter level 1, both **non-seasonal and seasonal** are run for each time series, and the **best model** is selected in order by:
+  + **AIC** (smaller value is better)
+  + **BIC** (smaller value is better)
+  + difference between train and test set **RMSE** (smaller value indicates lesser probability of model overfit)
+4. The **entire dataset** (60 data points) is then used as input to the best model to produce a **12 steps-ahead forecast** (202001 - 202012) 
+
+*Note that the time taken to run models for one time series is approximately 45 seconds*
+
+```{r start timer, include=FALSE}
+start.time <<- Sys.time()
+```
+
+We use the *tseries* packages for the ARIMA modelling. 
+```{r warning=FALSE}
+pacman::p_load(tidyr, dplyr, ggplot2, openxlsx, lubridate, tseries, forecast, astsa)
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_knit$set(root.dir = "C:/Users/cshen/Documents/Dataset")
+knitr::opts_knit$set(root.dir = "C:/Users/Shenc/Documents/NUS EBAC/Capstone Project/Dataset")
+getwd()
+```
+
+******
+
+## Data Preparation
+```{r import dataset, include=FALSE}
+mitsta_xy0 <- read.csv("BOM_forecast.csv", 
+                      colClasses = c("MHITNO" = "character"))
+
+mitsta_xy <- mitsta_xy0 %>%
+  rename(MTITNO = MHITNO) %>%
+  arrange(MTITNO, MHCYP6) 
+```
+
+
+```{r include=FALSE}
+# custom function
+# extract auto arima order
+arima.order <- function (object) 
+{
+order <- object$arma[c(1, 6, 2, 3, 7, 4, 5)]
+result <- paste("ARIMA(", order[1], ",", order[2], ",", order[3], 
+    ")", sep = "")
+if (order[7] > 1 & sum(order[4:6]) > 0) 
+    result <- paste(result, "(", order[4], ",", order[5], 
+        ",", order[6], ")[", order[7], "]", sep = "")
+if (is.element("constant", names(object$coef)) | is.element("intercept", 
+    names(object$coef))) 
+    result <- paste(result, "with non-zero mean")
+else if (is.element("drift", names(object$coef))) 
+    result <- paste(result, "with drift        ")
+else if (order[2] == 0 & order[5] == 0) 
+    result <- paste(result, "with zero mean    ")
+else result <- paste(result, "                  ")
+return(result)
+}
+```
+
+```{r include=FALSE}
+# custom function
+# select best model for each TS object
+# criteria:
+# - minimising AIC (model is considered to be closer to the truth)
+# - minimising BIC (model is considered to be more likely to be the true model)
+# - minimising rmse train and test gap (model is not overfitting
+
+select_mod <- function(data){
+  
+  data %>%
+  mutate(aic = as.numeric(as.character(aic)),
+         bic = as.numeric(as.character(bic)),
+         rmse_gap = as.numeric(as.character(rmse_gap)),
+         train_rmse = as.numeric(as.character(train_rmse)),
+         test_rmse = as.numeric(as.character(test_rmse)),
+         residuals = as.numeric(as.character(residuals)),
+         avg_fc = as.numeric(as.character(avg_fc)),
+         mod.index = row_number(),
+         order = as.character(order)) %>%
+  filter(residuals > 0.05,
+         aic > 0,
+         bic > 0,
+         avg_fc != max(avg_fc),
+         avg_fc != min(avg_fc),
+         var != 0,
+         model != "mod.80") %>%
+         # order != "ARIMA(0,0,0) with non-zero mean") %>%
+  arrange(aic) %>%
+  head(5) %>%
+  arrange(bic) %>%
+  head(3) %>%
+  arrange(test_rmse) %>%
+  head(1) 
+}
+```
+
+
+We get the **consumption data from 201501 to 201912**. The dates as set as below. 
+```{r}
+# Set dates here
+from_date <- c("2015/01/01")
+to_date <- c("2019/12/01")
+
+# start and end year for train data
+start_year_train <- 2015
+end_year_train <- 2018
+
+# start and end year for test data
+start_year_test <- 2019
+end_year_test <- 2019
+
+# start and end month
+start_mth <- 1
+end_mth <- 12
+```
+
+The data is cleaned with the following considerations:
+
+1. consumption = used qty + negative transfer + sold quantity
+2. if the consumption data is **negative**, we will impute it with *na.interp()* function from the *forecast package*
+  + negative value is a result of data input practice whereby the same field is used to record the transfer of data to upstream warehouse (for consumption) and a return of stocks for reasons such as quality checks
+3. if there are **missing months**, it is assumed that there are no transactions for that period and therefore the the missing value will be taken as 0 
+
+```{r warning=FALSE}
+# clean mista raw data
+# to select only data from 201501 to 201912
+clean_yearmon <- mitsta_xy %>%
+  filter(!grepl("+00", MHCYP6), # remove year ending with 00
+         #!grepl("2015+", MHCYP6),
+         !grepl("202+", MHCYP6)) %>% # remove data after 2020
+  # split new columns for year and month
+  mutate(month = format(as.Date(paste(MHCYP6,"01"), "%Y%m%d"), "%m"),
+         year = format(as.Date(paste(MHCYP6,"01"), "%Y%m%d"), "%Y"),
+         month = as.integer(month))  
+
+# calculate total conumsption, including transfers to other warehouse 
+cal_conspt <- clean_yearmon %>%
+  mutate(consume = used_qty + neg_tsf + sold_qty) 
+
+# there maybe missing month whereby there is no record of data
+# create a dummy dataframe to these missing month and replace with 0
+dummy <- clean_yearmon %>%
+  
+  # select the required columns
+  select(MTITNO, MHWHLO) %>%
+  
+  # remove duplicates
+  unique() %>%
+  
+  # create 60 data points per itno and warehouse
+  slice(rep(seq_len(n()), 60)) %>%
+  
+  # sort by itno followed by warehouse
+  arrange(MTITNO, MHWHLO) 
+
+# create a sequence of date with 60 data points from 201501 to 201912
+date <- seq(as.Date(from_date), as.Date(to_date), by = "month")
+
+# insert the date into the dummy dataframe
+dummy$MHCYP6 <- format(as.Date(date), "%Y%m")
+
+# create final dataset
+mitsta_xy_cln <- dummy %>%
+  
+  # convert date to integer
+  mutate(MHCYP6 = as.integer(MHCYP6)) %>%
+  
+  # join table
+  left_join(cal_conspt, by = c("MTITNO", "MHWHLO", "MHCYP6")) %>%
+  
+  # convert neg consumption to NA
+  # imputation will be done at TS transformatino stage
+  # create an id column to differentiate by warehouses
+  mutate(consume = replace_na(consume, 0),
+         consume = ifelse(consume < 0, NA, consume),
+         id = paste(MTITNO, "_", MHWHLO)) %>%
+  rename(MTITNO.0 = MTITNO,
+         MTITNO = id)
+
+head(mitsta_xy_cln )
+```
+
+******
+
+## Modelling
+
+We first split the dataset of 60 data points into a train and test set
+```{r create TS objects (loop)}
+unique_itno <- unique(mitsta_xy_cln$MTITNO) # a list containing unique item numbers
+
+# select only item number (unique id) and consumption history
+data_ts <- mitsta_xy_cln %>%
+  mutate(consume = as.numeric(consume))  %>%
+  select(consume, MTITNO) #%>%
+  # mutate (index = rep(1:length(unique_itno), each = 60, times = 1)) %>%
+  # filter(index >5)
+
+
+# split into train and test sets
+# train: 4 year dataset with 48 data points
+# test: recent 1 year dataset with 12 data points
+# only train data will be analyzed 
+
+list_MTITNO <- unique(data_ts$MTITNO) # a list containing unique item numbers
+list_train <- list() # initiate an empty list to store train dataset
+list_test <- list() # initiate an empty list to store test dataset
+list_data <- list() # initiate an empty list to store full dataset
+
+# loop each item number into a ts objects and pass into the train dataset list
+
+for (m in list_MTITNO){
+  myname <- paste0('df_',m)
+  temp <- data_ts %>%
+    filter(MTITNO == m) %>%
+    select(consume) %>%
+    na.interp() %>% 
+    ts(data_ts$consume, frequency = 12, start = c(start_year_train, start_mth), end = c(end_year_train, end_mth))
+  list_train[[myname]] <- temp
+}
+
+# loop each item number into a ts objects and pass into the test dataset list
+for (m in list_MTITNO){
+  myname <- paste0('df_',m)
+  temp <- data_ts %>%
+    filter(MTITNO == m) %>%
+    select(consume) %>%
+    tail(15) %>%
+    na.interp() %>%
+    ts(data_ts$consume, frequency = 12, start = c(start_year_test, start_mth), end = c(end_year_test, end_mth))
+  list_test[[myname]] <- temp
+}
+
+# loop each item number into a ts objects and pass into the full dataset list
+
+for (m in list_MTITNO){
+  myname <- paste0('df_',m)
+  temp <- data_ts %>%
+    filter(MTITNO == m) %>%
+    select(consume) %>%
+    na.interp() %>%
+    ts(data_ts$consume, frequency = 12, start = c(start_year_train, start_mth), end = c(end_year_test, end_mth))
+  list_data[[myname]] <- temp
+}
+```
+
+We then loop the seasonal arima models to train 64 models for each time series item. 
+
+*This should be a fail safe process. If all three methods for the Arima() function failed, the R will run the auto.arima() function.*
+
+```{r ARIMA modelling, warning=FALSE}
+arima_list <- list() # empty list to store arima models for each item
+output_arima<- list() # empty list to store arima models for each iteration
+output_fc <- list() # empty list to store forecast output 
+
+df <- matrix(nrow = 64, ncol = 12) # empty dataframe to save forecast outputs
+
+# loop through all combinations of arima models (max order = 1) 
+# best model for each item is selected by rule
+# rule: AIC > BIC > rmse gap (mini difference between train and test errors)
+
+for (i in 1:length(list_train)){
+
+# initiate train and test objects
+train <- list_train[[i]]
+test <- list_test[[i]]
+
+# included tryCatch functions to skip errors
+# errors can occur when ARIMA method "ML" failed
+
+
+
+# order combinations
+c1 <- c(0, 1, 0)
+c2 <- c(0, 1, 1)
+c3 <- c(0, 0, 1)
+c4 <- c(1, 1, 1)
+c5 <- c(1, 0, 1)
+c6 <- c(1, 0, 0)
+c7 <- c(1, 1, 0)
+c8 <- c(0, 0, 0)
+
+# possible arima with max order 1 (non-seasonal)
+
+skip_to_next <- FALSE
+
+#==================================
+
+tryCatch({
+mod.10 <- Arima(train, order = c1, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.10 <<- Arima(train, order = c1, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.10 <<- Arima(train, order = c1, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.10 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.20 <- Arima(train, order = c2, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.20 <<- Arima(train, order = c2, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.20 <<- Arima(train, order = c2, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.20 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.30 <- Arima(train, order = c3, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.30 <<- Arima(train, order = c3, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.30 <<- Arima(train, order = c3, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.30 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.40 <- Arima(train, order = c4, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.40 <<- Arima(train, order = c4, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.40 <<- Arima(train, order = c4, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.40 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.50 <- Arima(train, order = c5, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.50 <<- Arima(train, order = c5, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.50 <<- Arima(train, order = c5, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.50 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.60 <- Arima(train, order = c6, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.60 <<- Arima(train, order = c6, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.60 <<- Arima(train, order = c6, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.60 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.70 <- Arima(train, order = c7, seasonal = c8)
+}, error=function(e){
+  tryCatch({
+  mod.70 <<- Arima(train, order = c7, seasonal = c8, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.70 <<- Arima(train, order = c7, seasonal = c8, method = "ML")
+}, error=function(e){
+  mod.70 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+mod.80 <- auto.arima(train)
+
+#==================================
+
+# possible seasonal arima with max order 1 
+
+#==================================
+
+tryCatch({
+mod.11 <- Arima(train, order = c1, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.11 <<- Arima(train, order = c1, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.11 <<- Arima(train, order = c1, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.11 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.21 <- Arima(train, order = c2, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.21 <<- Arima(train, order = c2, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.21 <<- Arima(train, order = c2, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.21 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.31 <- Arima(train, order = c3, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.31 <<- Arima(train, order = c3, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.31 <<- Arima(train, order = c3, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.31 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.41 <- Arima(train, order = c4, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.41 <<- Arima(train, order = c4, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.41 <<- Arima(train, order = c4, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.41 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.51 <- Arima(train, order = c5, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.51 <<- Arima(train, order = c5, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.51 <<- Arima(train, order = c5, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.51 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.61 <- Arima(train, order = c6, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.61 <<- Arima(train, order = c6, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.61 <<- Arima(train, order = c6, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.61 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.71 <- Arima(train, order = c7, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.71 <<- Arima(train, order = c7, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.71 <<- Arima(train, order = c7, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.71 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.81 <- Arima(train, order = c8, seasonal = c1)
+}, error=function(e){
+  tryCatch({
+  mod.81 <<- Arima(train, order = c8, seasonal = c1, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.81 <<- Arima(train, order = c8, seasonal = c1, method = "ML")
+}, error=function(e){
+  mod.81 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.12 <- Arima(train, order = c1, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.12 <<- Arima(train, order = c1, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.12 <<- Arima(train, order = c1, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.12 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.22 <- Arima(train, order = c2, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.22 <<- Arima(train, order = c2, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.22 <<- Arima(train, order = c2, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.22 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.32 <- Arima(train, order = c3, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.32 <<- Arima(train, order = c3, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.32 <<- Arima(train, order = c3, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.32 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.42 <- Arima(train, order = c4, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.42 <<- Arima(train, order = c4, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.42 <<- Arima(train, order = c4, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.42 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.52 <- Arima(train, order = c5, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.52 <<- Arima(train, order = c5, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.52 <<- Arima(train, order = c5, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.52 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.62 <- Arima(train, order = c6, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.62 <<- Arima(train, order = c6, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.62 <<- Arima(train, order = c6, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.62 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.72 <- Arima(train, order = c7, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.72 <<- Arima(train, order = c7, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.72 <<- Arima(train, order = c7, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.72 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.82 <-Arima(train, order = c8, seasonal = c2)
+}, error=function(e){
+  tryCatch({
+  mod.82 <<-Arima(train, order = c8, seasonal = c2, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.82 <<- Arima(train, order = c8, seasonal = c2, method = "ML")
+}, error=function(e){
+  mod.82 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.13 <-Arima(train, order = c1, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.13 <<-Arima(train, order = c1, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.13 <<- Arima(train, order = c1, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.13 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.23 <- Arima(train, order = c2, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.23 <<- Arima(train, order = c2, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.23 <<- Arima(train, order = c2, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.23 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.33 <- Arima(train, order = c3, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.33 <<- Arima(train, order = c3, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.33 <<- Arima(train, order = c3, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.33 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.43 <- Arima(train, order = c4, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.43 <<- Arima(train, order = c4, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.43 <<- Arima(train, order = c4, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.43 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.53 <- Arima(train, order = c5, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.53 <<- Arima(train, order = c5, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.53 <<- Arima(train, order = c5, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.53 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.63 <- Arima(train, order = c6, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.63 <<- Arima(train, order = c6, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.63 <<- Arima(train, order = c6, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.63 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.73 <- Arima(train, order = c7, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.73 <<- Arima(train, order = c7, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.73 <<- Arima(train, order = c7, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.73 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.83 <- Arima(train, order = c8, seasonal = c3)
+}, error=function(e){
+  tryCatch({
+  mod.83 <<- Arima(train, order = c8, seasonal = c3, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.83 <<- Arima(train, order = c8, seasonal = c3, method = "ML")
+}, error=function(e){
+  mod.83 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.14 <- Arima(train, order = c1, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.14 <<- Arima(train, order = c1, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.14 <<- Arima(train, order = c1, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.14 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.24 <- Arima(train, order = c2, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.24 <<- Arima(train, order = c2, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.24 <<- Arima(train, order = c2, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.24 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.34 <- Arima(train, order = c3, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.34 <<- Arima(train, order = c3, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.34 <<- Arima(train, order = c3, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.34 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.44 <- Arima(train, order = c4, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.44 <<- Arima(train, order = c4, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.44 <<- Arima(train, order = c4, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.44 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.54 <- Arima(train, order = c5, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.54 <<- Arima(train, order = c5, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.54 <<- Arima(train, order = c5, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.54 <<- auto.arima(train)
+  })
+})
+})
+#==================================
+
+tryCatch({
+mod.64 <- Arima(train, order = c6, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.64 <<- Arima(train, order = c6, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.64 <<- Arima(train, order = c6, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.64 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.74 <- Arima(train, order = c7, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.74 <<- Arima(train, order = c7, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.74 <<- Arima(train, order = c7, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.74 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.84 <- Arima(train, order = c8, seasonal = c4)
+}, error=function(e){
+  tryCatch({
+  mod.84 <<- Arima(train, order = c8, seasonal = c4, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.84 <<- Arima(train, order = c8, seasonal = c4, method = "ML")
+}, error=function(e){
+  mod.84 <<- auto.arima(train)
+  })
+})
+})
+  
+#==================================
+
+tryCatch({
+mod.15 <- Arima(train, order = c1, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+  mod.15 <<- Arima(train, order = c1, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.15 <<- Arima(train, order = c1, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.15 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.25 <- Arima(train, order = c2, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+  mod.25 <<- Arima(train, order = c2, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.25 <<- Arima(train, order = c2, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.25 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.35 <- Arima(train, order = c3, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+  mod.35 <<- Arima(train, order = c3, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.35 <<- Arima(train, order = c3, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.35 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.45 <- Arima(train, order = c4, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+  mod.45 <<- Arima(train, order = c4, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.45 <<- Arima(train, order = c4, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.45 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.55 <- Arima(train, order = c5, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+    mod.55 <<- Arima(train, order = c5, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.55 <<- Arima(train, order = c5, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.55 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.65 <- Arima(train, order = c6, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+    mod.65 <<- Arima(train, order = c6, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.65 <<- Arima(train, order = c6, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.65 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+mod.75 <- Arima(train, order = c7, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+    mod.75 <<- Arima(train, order = c7, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.75 <<- Arima(train, order = c7, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.75 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.85 <- Arima(train, order = c8, seasonal = c5)
+}, error=function(e){
+  tryCatch({
+    mod.85 <<- Arima(train, order = c8, seasonal = c5, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.85 <<- Arima(train, order = c8, seasonal = c5, method = "ML")
+}, error=function(e){
+  mod.85 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.16 <- Arima(train, order = c1, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.16 <<- Arima(train, order = c1, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.16 <<- Arima(train, order = c1, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.16 <<- auto.arima(train)
+  })
+})
+})
+#==================================
+
+tryCatch({
+  
+mod.26 <- Arima(train, order = c2, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.26 <<- Arima(train, order = c2, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.26 <<- Arima(train, order = c2, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.26 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.36 <- Arima(train, order = c3, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.36 <<- Arima(train, order = c3, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.36 <<- Arima(train, order = c3, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.36 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.46 <- Arima(train, order = c4, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.46 <<- Arima(train, order = c4, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.46 <<- Arima(train, order = c4, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.46 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.56 <- Arima(train, order = c5, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.56 <<- Arima(train, order = c5, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.56 <<- Arima(train, order = c5, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.56 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.66 <- Arima(train, order = c6, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.66 <<- Arima(train, order = c6, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.66 <<- Arima(train, order = c6, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.66 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.76 <- Arima(train, order = c7, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.76 <<- Arima(train, order = c7, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.76 <<- Arima(train, order = c7, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.76 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.86 <- Arima(train, order = c8, seasonal = c6)
+}, error=function(e){
+  tryCatch({
+    mod.86 <<- Arima(train, order = c8, seasonal = c6, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.86 <<- Arima(train, order = c8, seasonal = c6, method = "ML")
+}, error=function(e){
+  mod.86 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.17 <- Arima(train, order = c1, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.17 <<- Arima(train, order = c1, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.17 <<- Arima(train, order = c1, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.17 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.27 <- Arima(train, order = c2, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.27 <<- Arima(train, order = c2, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.27 <<- Arima(train, order = c2, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.27 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.37 <- Arima(train, order = c3, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.37 <<- Arima(train, order = c3, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.37 <<- Arima(train, order = c3, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.37 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+tryCatch({
+  
+mod.47 <- Arima(train, order = c4, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.47 <<- Arima(train, order = c4, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.47 <<- Arima(train, order = c4, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.47 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.57 <- Arima(train, order = c5, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.57 <<- Arima(train, order = c5, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.57 <<- Arima(train, order = c5, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.57 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+tryCatch({
+  
+mod.67 <- Arima(train, order = c6, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.67 <<- Arima(train, order = c6, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.67 <<- Arima(train, order = c6, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.67 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+tryCatch({
+  
+mod.77 <<- Arima(train, order = c7, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.77 <<- Arima(train, order = c7, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.77 <<- Arima(train, order = c7, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.77 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+tryCatch({
+  
+mod.87 <- Arima(train, order = c8, seasonal = c7)
+}, error=function(e){
+  tryCatch({
+    mod.87 <<- Arima(train, order = c8, seasonal = c7, method = "CSS")
+}, error=function(e){
+  tryCatch({
+  mod.87 <<- Arima(train, order = c8, seasonal = c7, method = "ML")
+}, error=function(e){
+  mod.87 <<- auto.arima(train)
+  })
+})
+})
+
+#==================================
+
+
+# loop a list to store the models
+  for (m in 1:8){
+    for (n in 0:7){
+      x <- m
+      y <- n
+      index <- paste("mod.",x, y, sep="")
+      mod <- get(paste("mod.",x, y, sep=""))
+  
+      arima_list[[index]] <- mod # save models for each item into a list
+  
+      forecast <- lapply(arima_list, forecast, h=12) # 12 period fc (for calculation of rmse)
+      forecast_24 <- lapply(arima_list, forecast, h=24) # 24 period fc (for visualisation)
+      order <- lapply(arima_list, arima.order) # extract arima order (based on custom function) 
+
+# loop a list for final output
+        for (k in 1:length(arima_list)){
+  
+          name <- names(arima_list[k]) # extract model names
+          or <- order[[k]] # extract arima order
+          
+          mod <- arima_list[[k]] # extract arima model 
+          aic <- mod$aic # extract AIC score
+          bic <- mod$bic # extract BIC score
+          res <- Box.test(mod$residuals)$p.value # extract residual test based on Ljung box test. P-value > 0.05, res are white noise
+          
+          fit <- forecast[[k]] # extract fc for each mod in each item  
+          acc <- accuracy(fit, test) # extract accuracy measures
+          test_rmse <- acc[2,2] # extract rmse for test dataset
+          train_rmse <- acc[1,2] # extract rmse for train dataset
+          gap <- abs(test_rmse - train_rmse) # compare test and train dataset rmse
+          test_mape <- acc[2,5] # extract mape test dataset
+          train_mape <- acc[1,5] # extract mape train dataset
+          
+          fc<- forecast[[k]]
+          fc <- as.data.frame(fc)
+          mean_fc <- fc %>% summarise(avg = mean(`Point Forecast`))
+          mean_fc <- as.numeric(mean_fc)
+                    var_fc <- fc %>% summarise(var = var(`Point Forecast`))
+          var_fc <- as.numeric(var_fc)
+  
+          # save output into a dataframe
+          df[k,] <- c(name, aic, bic, or, train_rmse, test_rmse, gap, train_mape, test_mape, res, mean_fc, var_fc) 
+          
+          # convert to dataframe and rename columns
+          mod_error <- as.data.frame(df) 
+          colnames(mod_error) <- c("model", "aic","bic", "order",
+                                   "train_rmse", "test_rmse", "rmse_gap",
+                                   "train_mape", "test_mape", "residuals", 
+                                   "avg_fc", "var")
+          
+          output_arima[[i]] <- mod_error # save model information to final list
+          output_fc[[i]] <- forecast_24 # save forecast data (24 period) to final list
+     
+      }
+    }
+  }
+}  
+
+# back up output
+saveRDS(output_fc, file = "output_fc_all.Rds")
+saveRDS(output_arima, file = "output_arima_all.Rds")
+```
+
+The **best model** will be selected based on the criteria:
+
+1. Top 5 smallest **AIC**
+2. from (1), select the Top 3 smallest **BIC**
+3. from (2), select the **smallest RMSE difference** between the train and test sets
+  + this is to minimise the chances of model overfit whereby the RMSE is small on the train set but large on the test set 
+```{r best model selection}
+# select best model based on custom function into a list
+best_mod <- lapply(output_arima, select_mod)
+
+# convert list into a dataframe
+select <- do.call(rbind.data.frame, best_mod)
+
+# index = item number position in original data
+# mod.index = model position in forecast output list (output_fc)
+# thus, each row shows the best model for each item number
+arima_mod <- select  %>%
+  mutate(index = row_number())
+```
+
+The full dataset of 60 data points is used as input for the best model of each time series item
+```{r ARIMA modelling}
+arima_list_final <- list() # empty list to store arima models for each item
+best_fc_12 <- list() # empty list to store forecast output 
+
+# loop through all models based on entire dataset
+for (i in 1:length(list_data)){
+
+# initiate train and test objects
+train <- list_data[[i]]
+
+# included tryCatch functions to skip errors
+# errors can occur when ARIMA method "ML" failed
+
+# order combinations
+c1 <- c(0, 1, 0)
+c2 <- c(0, 1, 1)
+c3 <- c(0, 0, 1)
+c4 <- c(1, 1, 1)
+c5 <- c(1, 0, 1)
+c6 <- c(1, 0, 0)
+c7 <- c(1, 1, 0)
+c8 <- c(0, 0, 0)
+
+# possible arima with max order 1 (non-seasonal)
+
+mod.10 <- c(c1, c8)
+mod.20 <- c(c2, c8)
+mod.30 <- c(c3, c8)
+mod.40 <- c(c4, c8)
+mod.50 <- c(c5, c8)
+mod.60 <- c(c6, c8)
+mod.70 <- c(c7, c8)
+mod.80 <- auto.arima(train)
+
+mod.11 <- c(c1, c1)
+mod.21 <- c(c2, c1)
+mod.31 <- c(c3, c1)
+mod.41 <- c(c4, c1)
+mod.51 <- c(c5, c1)
+mod.61 <- c(c6, c1)
+mod.71 <- c(c7, c1)
+mod.81 <- c(c8, c1)
+
+mod.12 <- c(c1, c2)
+mod.22 <- c(c2, c2)
+mod.32 <- c(c3, c2)
+mod.42 <- c(c4, c2)
+mod.52 <- c(c5, c2)
+mod.62 <- c(c6, c2)
+mod.72 <- c(c7, c2)
+mod.82 <- c(c8, c2)
+
+mod.13 <- c(c1, c3)
+mod.23 <- c(c2, c3)
+mod.33 <- c(c3, c3)
+mod.43 <- c(c4, c3)
+mod.53 <- c(c5, c3)
+mod.63 <- c(c6, c3)
+mod.73 <- c(c7, c3)
+mod.83 <- c(c8, c3)
+
+mod.14 <- c(c1, c4)
+mod.24 <- c(c2, c4)
+mod.34 <- c(c3, c4)
+mod.44 <- c(c4, c4)
+mod.54 <- c(c5, c4)
+mod.64 <- c(c6, c4)
+mod.74 <- c(c7, c4)
+mod.84 <- c(c8, c4)
+  
+mod.15 <- c(c1, c5)
+mod.25 <- c(c2, c5)
+mod.35 <- c(c3, c5)
+mod.45 <- c(c4, c5)
+mod.55 <- c(c5, c5)
+mod.65 <- c(c6, c5)
+mod.75 <- c(c7, c5)
+mod.85 <- c(c8, c5)
+  
+mod.16 <- c(c1, c6)
+mod.26 <- c(c2, c6)
+mod.36 <- c(c3, c6)
+mod.46 <- c(c4, c6)
+mod.56 <- c(c5, c6)
+mod.66 <- c(c6, c6)
+mod.76 <- c(c7, c6)
+mod.86 <- c(c8, c6)
+
+mod.17 <- c(c1, c7)
+mod.27 <- c(c2, c7)
+mod.37 <- c(c3, c7)
+mod.47 <- c(c4, c7)
+mod.57 <- c(c5, c7)
+mod.67 <- c(c6, c7)
+mod.77 <- c(c7, c7)
+mod.87 <- c(c8, c7)
+
+
+row <- arima_mod[i,] 
+b.mod <- row %>%
+  select(model) %>%
+  droplevels() %>%
+  mutate(model = as.character(model))
+
+mod <- get(paste(b.mod))
+
+  tryCatch({
+select.mod <- Arima(train,
+                    order = c(mod[1], mod[2], mod[3]),
+                    seasonal = c(mod[4], mod[5], mod[6]))
+}, error = function(e){
+  
+  select.mod <- Arima(train,
+                    order = c(mod[1], mod[2], mod[3]),
+                    seasonal = c(mod[4], mod[5], mod[6]), method = "ML")
+})
+  
+  
+      forecast <- forecast(select.mod, h=12) # 12 period fc (for calculation of rmse)
+      
+      best_fc_12[[i]] <- forecast # save forecast data (24 period) to final list
+     
+}
+```
+
+Generate a dataframe for the 12-step ahead forecast, which can be the input for the multi-echelon model. 
+```{r generate df}
+# combine list into a dataframe for 12 periods forecast
+arima_fc_12 <- plyr::ldply (best_fc_12, data.frame)
+
+# create an index column to match to item number
+# index = item number position in original data
+x <- length(list_data) 
+arima_fc_12$index <- rep(1:x, each = 12, times = 1)
+
+# create a label for time series identification (item number and warehouse)
+label <- as.data.frame(unique_itno)
+label <- label %>%
+  mutate(unique_itno = as.character(unique_itno),
+         index = row_number()) %>%
+  separate(unique_itno, into = c("MTITNO", "whse"), "_") 
+
+
+# create final dataframe
+forecast_output <- arima_fc_12 %>%
+  rename(forecast = Point.Forecast) %>%
+  select(forecast, index) %>%
+  mutate(forecast = round(ifelse(forecast < 0 , 0, forecast),0)) %>%
+  left_join(label, by = "index") %>%
+  select(MTITNO, whse, forecast)
+```
+
+
+```{r export data, include=FALSE}
+# export cleaned mista
+write.csv(mitsta_xy_cln, "mitsta_xy_cln_all.csv")
+
+# export final forecast output
+write.csv(forecast_output, "forecast_output.csv")
+```
+
+time taken to run code - stop
+```{r end timer, echo=FALSE}
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
